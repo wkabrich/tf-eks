@@ -10,7 +10,7 @@ module "vpc_endpoints" {
 
   name            = "payments-prod"
   vpc_id          = module.vpc.vpc_id
-  subnet_ids      = module.vpc.private_subnets         # one per AZ
+  subnet_ids      = module.vpc.private_subnet_ids      # one per AZ (module.vpc is ../vpc)
   route_table_ids = module.vpc.private_route_table_ids # for the S3 gateway endpoint
 
   interface_endpoints = ["ec2", "ecr.api", "ecr.dkr", "eks", "eks-auth", "logs", "sts", "ssm", "ssmmessages"]

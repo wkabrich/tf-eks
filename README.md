@@ -60,7 +60,7 @@ Static analysis: `trivy config` and `checkov` both pass with zero findings on th
 
 1. **VPC DNS.** `enableDnsSupport` and `enableDnsHostnames` must be on, and the DHCP options must include `AmazonProvidedDNS`. The module checks the first two at plan time.
 2. **Private subnets.** Subnets for nodes, plus (recommended) dedicated `/28` subnets for the control-plane ENIs, each spread over at least two AZs. The plan fails if a node subnet auto-assigns public IPs, or if a control-plane subnet is in an AZ that EKS rejects (`use1-az3`, `usw1-az2`, `cac1-az3`).
-3. **VPC endpoints** when nodes have no NAT. Use [`modules/vpc-endpoints`](modules/vpc-endpoints) or your shared endpoints.
+3. **VPC endpoints** when nodes have no NAT. Use [`modules/vpc-endpoints`](modules/vpc-endpoints) or your shared endpoints. [`modules/vpc`](modules/vpc) builds a matching VPC from scratch if you don't have one.
 
    | Endpoint | Why | Needed |
    |---|---|---|
@@ -81,7 +81,7 @@ Static analysis: `trivy config` and `checkov` both pass with zero findings on th
 
 ```hcl
 module "eks" {
-  source = "git::https://example.com/your-org/tf-eks.git?ref=v1.0.0"
+  source = "../tf-eks" # local path to this module
 
   name               = "payments-prod"
   kubernetes_version = "1.37"
@@ -139,7 +139,7 @@ module "eks" {
 }
 ```
 
-[`examples/complete`](examples/complete) builds everything end to end: a VPC with no NAT, dedicated control-plane subnets, flow logs, the endpoints, and the cluster.
+[`examples/complete`](examples/complete) builds everything end to end from local modules only: a VPC with no NAT (`modules/vpc`), dedicated control-plane subnets, encrypted flow logs, the endpoints (`modules/vpc-endpoints`), and the cluster.
 
 ## Reaching the cluster
 
@@ -219,7 +219,8 @@ Inline suppressions, each with a reason in the code:
 | `CKV_AWS_111/356` | SSM and IPv6 CNI policies | Those actions do not support resource-level permissions |
 | `CKV_AWS_382`, `AWS-0104` | Opt-in allow-all egress rules | Only created when `node_security_group_allow_all_egress = true` |
 | `CKV_AWS_1/49` | `modules/vpc-endpoints` perimeter policy | Resource-based endpoint policy; `"*"` is limited by the principal-account/org condition |
-| `CKV_TF_1`, `CKV_AWS_394`, KMS policy checks | `examples/complete` | Registry module pinned by version; AZs chosen dynamically with EKS-unsupported zone IDs excluded |
+| `CKV_AWS_394` | `examples/complete` | AZs chosen dynamically, with EKS-unsupported zone IDs excluded |
+| `CKV_AWS_109/111/356` | `modules/vpc` flow-log key policy | In a key policy, `Resource "*"` means the key itself |
 
 ## Testing
 
@@ -231,11 +232,16 @@ terraform init -backend=false && terraform test
 cd modules/vpc-endpoints && terraform init -backend=false && terraform test
 ```
 
+```bash
+cd modules/vpc && terraform init -backend=false && terraform test
+```
+
 The tests mock the AWS provider, so they need no credentials:
 
 - `tests/unit.tftest.hcl` (plan only) asserts the security defaults, the trust-policy and key-policy conditions, and the main guard rails (validations and preconditions).
 - `tests/lifecycle.tftest.hcl` applies against mocks, then shows both key guards refusing key switches. That includes handing the module's own key over as a caller key, which the ARN comparison alone misses.
 - `modules/vpc-endpoints/tests` covers the endpoint set, the data perimeter, and resetting the policies when the perimeter is turned off.
+- `modules/vpc/tests` covers private-only subnets, the locked-down default security group and encrypted flow logs.
 
 Mocks cannot prove AWS-side behaviour such as EKS add-on health, node bootstrap through the endpoints, or KMS grants. Validate those with a real `examples/complete` deployment.
 

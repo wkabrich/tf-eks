@@ -9,10 +9,6 @@ provider "aws" {
   }
 }
 
-data "aws_partition" "current" {}
-data "aws_region" "current" {}
-data "aws_caller_identity" "current" {}
-
 data "aws_availability_zones" "available" {
   #checkov:skip=CKV_AWS_394:Zones are picked dynamically; zone IDs EKS rejects for control-plane subnets are excluded below.
   state = "available"
@@ -29,55 +25,12 @@ locals {
   azs = slice(data.aws_availability_zones.available.names, 0, min(3, length(data.aws_availability_zones.available.names)))
 }
 
-# VPC flow logs get their own customer managed key, like every other log group in this example.
-data "aws_iam_policy_document" "flow_logs_kms" {
-  #checkov:skip=CKV_AWS_109:KMS key policy - Resource "*" refers to the key the policy is attached to.
-  #checkov:skip=CKV_AWS_111:KMS key policy - Resource "*" refers to the key the policy is attached to.
-  #checkov:skip=CKV_AWS_356:KMS key policy - Resource "*" refers to the key the policy is attached to.
-  statement {
-    sid       = "EnableIAMPolicies"
-    actions   = ["kms:*"]
-    resources = ["*"]
-
-    principals {
-      type        = "AWS"
-      identifiers = ["arn:${data.aws_partition.current.partition}:iam::${data.aws_caller_identity.current.account_id}:root"]
-    }
-  }
-
-  statement {
-    sid       = "CloudWatchLogsUseForFlowLogs"
-    actions   = ["kms:Decrypt", "kms:Describe*", "kms:Encrypt", "kms:GenerateDataKey*", "kms:ReEncrypt*"]
-    resources = ["*"]
-
-    principals {
-      type        = "Service"
-      identifiers = ["logs.${data.aws_region.current.region}.${data.aws_partition.current.dns_suffix}"]
-    }
-
-    condition {
-      test     = "ArnLike"
-      variable = "kms:EncryptionContext:aws:logs:arn"
-      values   = ["arn:${data.aws_partition.current.partition}:logs:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:log-group:/aws/vpc-flow-log/*"]
-    }
-  }
-}
-
-resource "aws_kms_key" "flow_logs" {
-  description             = "${var.name}: VPC flow logs"
-  enable_key_rotation     = true
-  deletion_window_in_days = 30
-  policy                  = data.aws_iam_policy_document.flow_logs_kms.json
-}
-
 ################################################################################
 # Network: no internet gateway, no NAT. Nodes reach AWS only through VPC endpoints.
 ################################################################################
 
 module "vpc" {
-  #checkov:skip=CKV_TF_1:Registry module pinned to an exact version.
-  source  = "terraform-aws-modules/vpc/aws"
-  version = "6.7.3"
+  source = "../../modules/vpc"
 
   name = var.name
   cidr = var.vpc_cidr
@@ -86,26 +39,44 @@ module "vpc" {
   # Node subnets (/20 each). Routes stay inside the VPC.
   private_subnets = [for i, _ in local.azs : cidrsubnet(var.vpc_cidr, 4, i)]
   # Dedicated /28 subnets for the EKS control-plane ENIs, as the EKS best practices recommend.
-  intra_subnets = [for i, _ in local.azs : cidrsubnet(var.vpc_cidr, 12, 4080 + i)]
+  control_plane_subnets = [for i, _ in local.azs : cidrsubnet(var.vpc_cidr, 12, 4080 + i)]
 
-  enable_nat_gateway   = false
-  enable_dns_hostnames = true
-  enable_dns_support   = true
+  # Flow logs (on by default) go to a KMS-encrypted log group kept for a year.
+}
 
-  private_subnet_tags = {
-    "kubernetes.io/role/internal-elb" = "1"
+# Upgrade path from the first published version of this example, which used the registry VPC module.
+# No-ops for fresh deployments. The control-plane subnets keep their identity (recreating them with the
+# same CIDRs would conflict while EKS still uses them), and the old flow-log group and its key are
+# kept, not destroyed, so earlier flow-log history stays readable.
+moved {
+  from = module.vpc.aws_subnet.intra
+  to   = module.vpc.aws_subnet.control_plane
+}
+
+moved {
+  from = module.vpc.aws_route_table.intra
+  to   = module.vpc.aws_route_table.control_plane
+}
+
+moved {
+  from = module.vpc.aws_route_table_association.intra
+  to   = module.vpc.aws_route_table_association.control_plane
+}
+
+removed {
+  from = module.vpc.aws_cloudwatch_log_group.flow_log
+
+  lifecycle {
+    destroy = false
   }
+}
 
-  # Lock down the default security group and record traffic for forensics.
-  manage_default_security_group  = true
-  default_security_group_ingress = []
-  default_security_group_egress  = []
+removed {
+  from = aws_kms_key.flow_logs
 
-  enable_flow_log                                 = true
-  create_flow_log_cloudwatch_log_group            = true
-  create_flow_log_cloudwatch_iam_role             = true
-  flow_log_cloudwatch_log_group_retention_in_days = 365
-  flow_log_cloudwatch_log_group_kms_key_id        = aws_kms_key.flow_logs.arn
+  lifecycle {
+    destroy = false
+  }
 }
 
 module "vpc_endpoints" {
@@ -113,7 +84,7 @@ module "vpc_endpoints" {
 
   name                = var.name
   vpc_id              = module.vpc.vpc_id
-  subnet_ids          = module.vpc.private_subnets
+  subnet_ids          = module.vpc.private_subnet_ids
   route_table_ids     = module.vpc.private_route_table_ids
   allowed_cidr_blocks = [module.vpc.vpc_cidr_block]
 
@@ -135,8 +106,8 @@ module "eks" {
   kubernetes_version = var.kubernetes_version
 
   vpc_id                   = module.vpc.vpc_id
-  node_subnet_ids          = module.vpc.private_subnets
-  control_plane_subnet_ids = module.vpc.intra_subnets
+  node_subnet_ids          = module.vpc.private_subnet_ids
+  control_plane_subnet_ids = module.vpc.control_plane_subnet_ids
 
   cluster_endpoint_allowed_cidr_blocks = var.admin_cidr_blocks
   service_ipv4_cidr                    = "172.20.0.0/16"
